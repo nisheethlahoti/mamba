@@ -202,7 +202,7 @@ def sync_and_wait(out):
             torch.cuda.synchronize()
 
 
-def time_fn(fn, n_warmup=5, n_runs=100):
+def time_fn(fn, n_warmup=3, n_runs=20):
     """Time a function, return median ms."""
     for _ in range(n_warmup):
         sync_and_wait(fn())
@@ -287,8 +287,8 @@ def benchmark_timing(batch=2, nheads=32, nheads_qk=1,
 
         t_fwd = time_fn(torch_fwd)
         j_fwd = time_fn(jax_fwd)
-        t_fb = time_fn(torch_fwd_bwd, n_runs=50)
-        j_fb = time_fn(jax_fwd_bwd, n_runs=50)
+        t_fb = time_fn(torch_fwd_bwd)
+        j_fb = time_fn(jax_fwd_bwd)
 
         print(f"  {seqlen:>8d}  {t_fwd:>12.3f}  {j_fwd:>12.3f}  {t_fb:>14.3f}  {j_fb:>14.3f}")
 
