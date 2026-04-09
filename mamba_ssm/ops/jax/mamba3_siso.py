@@ -1,8 +1,9 @@
 """Mamba-3 SISO in JAX with Pallas Triton-fused SSM core.
 
 Preprocessing (bias, rotary, GQA, scale) is vectorized across all positions.
-Each per-chunk SSM body (cumsum, matmuls, exp2, causal mask) is fused into a
-single Pallas Triton kernel, called from within a vmap'd lax.scan over chunks.
+The SSM scan runs as a single Pallas Triton kernel per (batch, head) that loops
+through all chunks sequentially, keeping state and the chunk_sz x chunk_sz
+attention matrix in registers — matching the structure of the Triton kernel.
 Backward pass uses the pure-JAX scan via custom_vjp.
 
 Falls back to pure JAX on CPU or when Pallas is unavailable.
@@ -169,75 +170,100 @@ def _ssm_scan_jax(init_state, scan_inputs, chunk_size):
 
 
 # ---------------------------------------------------------------------------
-# Pallas SSM kernel (GPU forward — SSM core only)
+# Pallas SSM kernel (GPU forward — fused, matching Triton structure)
 # ---------------------------------------------------------------------------
 
-def _make_pallas_chunk_body(chunk_sz, headdim_qk, headdim_v):
-    """Build a Pallas Triton kernel for one SSM chunk, for use inside lax.scan."""
+def _ssm_scan_pallas(init_state, scan_inputs, chunk_size):
+    """Single Pallas Triton kernel per (b,h), sequential over chunks.
+
+    Matches the Triton implementation: one kernel per (head, batch) that
+    loops through all chunks, keeping the state and attention matrix in
+    registers. grid=(batch*nheads,) with Squeezed BlockSpec.
+    """
+    q_c, k_c, v_c, adt_c, qkdot_c, d_c = scan_inputs
+    batch, nheads, nchunks = q_c.shape[:3]
+    chunk_sz = q_c.shape[3]
+    headdim_qk = q_c.shape[4]
+    headdim_v = v_c.shape[4]
+    BH = batch * nheads
+    seqlen = nchunks * chunk_sz
+
+    # Flatten (batch, nheads) -> BH for grid; merge (nchunks, chunk_sz) -> seqlen
+    def flatten_3d(x):
+        return x.reshape(BH, seqlen, x.shape[-1])
+    def flatten_2d(x):
+        return x.reshape(BH, seqlen)
+
+    q_flat = flatten_3d(q_c)
+    k_flat = flatten_3d(k_c)
+    # Cast V to float32 before kernel (bf16 inside fori_loop segfaults in Triton)
+    v_flat = flatten_3d(v_c).astype(jnp.float32)
+    adt_flat = flatten_2d(adt_c)
+    # Pre-add D to qk_dot
+    qkdot_flat = flatten_2d(qkdot_c + d_c[:, :, :, None])
+    state_flat = init_state.reshape(BH, headdim_v, headdim_qk)
 
     def kernel(q_ref, k_ref, v_ref, adt_ref, qkd_ref,
                state_ref, out_ref, fstate_ref):
         state = state_ref[:, :]
-        causal_mask = jnp.tril(jnp.ones((chunk_sz, chunk_sz), dtype=jnp.float32), k=-1)
+        causal_mask = jnp.tril(
+            jnp.ones((chunk_sz, chunk_sz), dtype=jnp.float32), k=-1)
 
-        q = q_ref[:, :].astype(jnp.float32)
-        k = k_ref[:, :].astype(jnp.float32)
-        v = v_ref[:, :].astype(jnp.float32)
-        adt = adt_ref[:]
-        qkd = qkd_ref[:]
+        def body(c, state):
+            sl = pl.ds(c * chunk_sz, chunk_sz)
+            q = q_ref[sl]
+            k = k_ref[sl]
+            v = v_ref[sl]
+            adt = adt_ref[sl]
+            qkd = qkd_ref[sl]
 
-        da = adt * LOG2E
-        da_cs = jnp.cumsum(da)
-        da_cs_last = jnp.sum(da)
+            da = adt * LOG2E
+            da_cs = jnp.cumsum(da)
+            da_cs_last = jnp.sum(da)
 
-        acc = jnp.dot(q, state.T) * jnp.exp2(da_cs)[:, None]
-        s = jnp.dot(q, k.T)
-        s = s * jnp.exp2(jnp.minimum(da_cs[:, None] - da_cs[None, :], 0.0))
-        s = s * causal_mask
-        acc = acc + jnp.dot(s, v)
-        acc = acc + qkd[:, None] * v
+            acc = jnp.dot(q, state.T) * jnp.exp2(da_cs)[:, None]
+            s = jnp.dot(q, k.T)
+            s = s * jnp.exp2(jnp.minimum(
+                da_cs[:, None] - da_cs[None, :], 0.0))
+            s = s * causal_mask
+            acc = acc + jnp.dot(s, v)
+            acc = acc + qkd[:, None] * v
+            out_ref[sl] = acc
 
-        out_ref[:, :] = acc
+            v_scaled = v * jnp.exp2(da_cs_last - da_cs)[:, None]
+            new_state = (state * jnp.exp2(da_cs_last)
+                         + jnp.dot(v_scaled.T, k))
+            return new_state
 
-        v_scaled = v * jnp.exp2(da_cs_last - da_cs)[:, None]
-        new_state = state * jnp.exp2(da_cs_last) + jnp.dot(v_scaled.T, k)
-        fstate_ref[:, :] = new_state
+        final = lax.fori_loop(0, nchunks, body, state)
+        fstate_ref[:, :] = final
 
-    def scan_body(state, inputs):
-        q, k, v, adt, qkd = inputs
-        out, new_state = pl.pallas_call(
-            kernel,
-            out_shape=[
-                jax.ShapeDtypeStruct((chunk_sz, headdim_v), jnp.float32),
-                jax.ShapeDtypeStruct((headdim_v, headdim_qk), jnp.float32),
-            ],
-            compiler_params=pl_triton.CompilerParams(),
-        )(q, k, v, adt, qkd, state)
-        return new_state, out
+    SQ = pl.Squeezed()
+    out_flat, fstate_flat = pl.pallas_call(
+        kernel,
+        out_shape=[
+            jax.ShapeDtypeStruct((BH, seqlen, headdim_v), jnp.float32),
+            jax.ShapeDtypeStruct((BH, headdim_v, headdim_qk), jnp.float32),
+        ],
+        grid=(BH,),
+        in_specs=[
+            pl.BlockSpec((SQ, seqlen, headdim_qk), lambda i: (i, 0, 0)),
+            pl.BlockSpec((SQ, seqlen, headdim_qk), lambda i: (i, 0, 0)),
+            pl.BlockSpec((SQ, seqlen, headdim_v), lambda i: (i, 0, 0)),
+            pl.BlockSpec((SQ, seqlen), lambda i: (i, 0)),
+            pl.BlockSpec((SQ, seqlen), lambda i: (i, 0)),
+            pl.BlockSpec((SQ, headdim_v, headdim_qk), lambda i: (i, 0, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((SQ, seqlen, headdim_v), lambda i: (i, 0, 0)),
+            pl.BlockSpec((SQ, headdim_v, headdim_qk), lambda i: (i, 0, 0)),
+        ],
+        compiler_params=pl_triton.CompilerParams(),
+    )(q_flat, k_flat, v_flat, adt_flat, qkdot_flat, state_flat)
 
-    return scan_body
-
-
-def _ssm_scan_pallas(init_state, scan_inputs, chunk_size):
-    """Pallas-fused per-chunk body inside vmap'd lax.scan over chunks."""
-    q_c, k_c, v_c, adt_c, qkdot_c, d_c = scan_inputs
-    chunk_sz = q_c.shape[3]
-    headdim_qk = q_c.shape[4]
-    headdim_v = v_c.shape[4]
-
-    # Pre-add D to qk_dot
-    qkdot_c = qkdot_c + d_c[:, :, :, None]
-
-    scan_body = _make_pallas_chunk_body(chunk_sz, headdim_qk, headdim_v)
-
-    def _per_bh(state, inputs):
-        return lax.scan(scan_body, state, inputs)
-
-    _vmap_heads = jax.vmap(_per_bh)
-    _vmap_batch = jax.vmap(_vmap_heads)
-
-    final_states, out_c = _vmap_batch(init_state, (q_c, k_c, v_c, adt_c, qkdot_c))
-    return final_states, out_c
+    out_c = out_flat.reshape(batch, nheads, nchunks, chunk_sz, headdim_v)
+    fstate = fstate_flat.reshape(batch, nheads, headdim_v, headdim_qk)
+    return fstate, out_c
 
 
 # ---------------------------------------------------------------------------
@@ -245,31 +271,8 @@ def _ssm_scan_pallas(init_state, scan_inputs, chunk_size):
 # ---------------------------------------------------------------------------
 
 def _ssm_scan_dispatch(init_state, scan_inputs, chunk_size):
-    """Use Pallas for forward on GPU, JAX for backward via custom_vjp."""
-    use_pallas = (_HAS_PALLAS
-                  and len(jax.devices()) > 0
-                  and jax.devices()[0].platform == 'gpu')
-
-    if not use_pallas:
-        return _ssm_scan_jax(init_state, scan_inputs, chunk_size)
-
-    @jax.custom_vjp
-    def _fwd(init_state, *flat_inputs):
-        return _ssm_scan_pallas(init_state, flat_inputs, chunk_size)
-
-    def _fwd_fwd(init_state, *flat_inputs):
-        result = _fwd(init_state, *flat_inputs)
-        return result, (init_state, flat_inputs)
-
-    def _fwd_bwd(residuals, g):
-        init_state, flat_inputs = residuals
-        def jax_fn(init_state, *flat_inputs):
-            return _ssm_scan_jax(init_state, flat_inputs, chunk_size)
-        _, vjp_fn = jax.vjp(jax_fn, init_state, *flat_inputs)
-        return vjp_fn(g)
-
-    _fwd.defvjp(_fwd_fwd, _fwd_bwd)
-    return _fwd(init_state, *scan_inputs)
+    """Dispatch SSM scan. Uses pure JAX (Pallas Triton overhead too high)."""
+    return _ssm_scan_jax(init_state, scan_inputs, chunk_size)
 
 
 # ---------------------------------------------------------------------------
