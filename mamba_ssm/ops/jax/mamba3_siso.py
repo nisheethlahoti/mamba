@@ -30,7 +30,8 @@ def angle_dt_cumsum(angles: Array, dt: Array, chunk_size: int = 64) -> Array:
     vals = rearrange(vals * dt_r, "b h nc cs d -> nc (b h) cs d")
 
     _, out = lax.scan(_angle_dt_scan_body, jnp.zeros((batch * nheads, dim)), vals)
-    return rearrange(out, "nc (b h) cs d -> b (nc cs) h d", b=batch, h=nheads)
+    out = rearrange(out, "nc (b h) cs d -> b (nc cs) h d", b=batch, h=nheads)
+    return out.astype(angles.dtype)
 
 
 def _apply_rotary_batched(x, cos, sin):
@@ -66,14 +67,14 @@ def _compute_scale_gamma(DT, Trap):
 def _mamba3_scan(Q, K, V, ADT, angles, scale, gamma, D, Z, Q_bias, K_bias, chunk_size):
     """Chunked SSM. All preprocessing done per-chunk inside scan body.
 
-    Q, K:           (batch, seqlen, nheads_qk, headdim_qk)
-    V:              (batch, seqlen, nheads, headdim_v)
-    ADT:            (batch, nheads, seqlen)
-    angles: (batch, seqlen, nheads, headdim_angles)
-    scale, gamma:   (batch, nheads, seqlen)
-    D:              (nheads,)
-    Z:              (batch, seqlen, nheads, headdim_v) or None
-    Q_bias, K_bias: (nheads, headdim_qk)
+    Q, K:           (batch, seqlen, nheads_qk, headdim_qk)     bf16
+    V:              (batch, seqlen, nheads, headdim_v)         bf16
+    ADT:            (batch, nheads, seqlen)                    f32
+    angles:         (batch, seqlen, nheads, headdim_angles)    bf16
+    scale, gamma:   (batch, nheads, seqlen)                    f32
+    D:              (nheads,)                                  bf16
+    Z:              (batch, seqlen, nheads, headdim_v) or None bf16
+    Q_bias, K_bias: (nheads, headdim_qk)                       bf16
     """
     batch, _, nheads_qk, headdim_qk = Q.shape
     nheads = V.shape[2]
@@ -81,25 +82,22 @@ def _mamba3_scan(Q, K, V, ADT, angles, scale, gamma, D, Z, Q_bias, K_bias, chunk
     BH = batch * nheads
     gqa_ratio = nheads // nheads_qk
 
-    def _to_scan(x_blhd):
+    def _to_chunks(x_blhd):
         return rearrange(x_blhd, "b (nc cs) h d -> nc (b h) cs d", cs=chunk_size)
 
-    def _to_scan_bhl(x):
+    def _to_chunks_bhl(x):
         return rearrange(x, "b h (nc cs) -> nc (b h) cs", cs=chunk_size)
 
-    v_s = _to_scan(V)
-    adt_s = _to_scan_bhl(ADT)
-    scale_s = _to_scan_bhl(scale)
-    gamma_s = _to_scan_bhl(gamma)
-    cos_s = _to_scan(jnp.cos(angles))
-    sin_s = _to_scan(jnp.sin(angles))
+    v_s = _to_chunks(V)
+    adt_s = _to_chunks_bhl(ADT.astype(jnp.float32))
+    scale_s = _to_chunks_bhl(scale.astype(jnp.bfloat16))
+    gamma_s = _to_chunks_bhl(gamma.astype(jnp.bfloat16))
+    cos_s = _to_chunks(jnp.cos(angles))
+    sin_s = _to_chunks(jnp.sin(angles))
+    q_s = _to_chunks(Q)
+    k_s = _to_chunks(K)
 
-    # Pass Q, K with original nheads_qk heads — GQA expansion inside scan body
-    q_s = _to_scan(Q)
-    k_s = _to_scan(K)
-
-
-    d_bh = repeat(D, "h -> (b h)", b=batch)
+    d_bh = repeat(D.astype(jnp.float32), "h -> (b h)", b=batch)
 
     state_init = jnp.zeros((BH, headdim_v, headdim_qk), dtype=jnp.float32)
     causal_mask = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=-1)
@@ -132,21 +130,21 @@ def _mamba3_scan(Q, K, V, ADT, angles, scale, gamma, D, Z, Q_bias, K_bias, chunk
         k = _apply_rotary_batched(k, cos_a, sin_a)
 
         # Scale K
-        k = k * sc[:, :, None]
+        k = k * sc.astype(jnp.bfloat16)[:, :, None]
 
         # --- SSM ---
         da_cs = adt.cumsum(axis=-1)
         da_cs_last = da_cs[:, -1]
 
         # Inter-chunk: (BH, L, hqk) @ (BH, hqk, hv) -> (BH, L, hv)
-        acc_o = q @ ssm_state.transpose(0, 2, 1)
+        acc_o = q @ ssm_state.astype(jnp.bfloat16).transpose(0, 2, 1)
         acc_o = acc_o * jnp.exp(da_cs)[:, :, None]
 
         # Intra-chunk: (BH, L, hqk) @ (BH, hqk, L) -> (BH, L, L)
-        s = q @ k.transpose(0, 2, 1)
+        s: Array = q @ k.transpose(0, 2, 1)
         s = s * jnp.exp(jnp.minimum(da_cs[:, :, None] - da_cs[:, None, :], 0.0))
         s = jnp.where(causal_mask[None, :, :], s, 0.0)
-        acc_o = acc_o + s @ v
+        acc_o = acc_o + s.astype(jnp.bfloat16) @ v
 
         # D-skip + QK diagonal
         acc_o = acc_o + (d_bh[:, None] + qk_dot)[:, :, None] * v
@@ -158,7 +156,7 @@ def _mamba3_scan(Q, K, V, ADT, angles, scale, gamma, D, Z, Q_bias, K_bias, chunk
         # (BH, hv, L) @ (BH, L, hqk) -> (BH, hv, hqk)
         new_state += v_scaled.transpose(0, 2, 1) @ k
 
-        return new_state, acc_o
+        return new_state, acc_o.astype(jnp.bfloat16)
 
     arrs = q_s, k_s, v_s, adt_s, scale_s, gamma_s, cos_s, sin_s
     _, out_s = lax.scan(jax.checkpoint(_scan_body), state_init, arrs)
@@ -216,6 +214,8 @@ def mamba3_siso_combined(
     K = _pad_seq(K).astype(jnp.bfloat16)
     V = _pad_seq(V).astype(jnp.bfloat16)
     Angles = _pad_seq(Angles).astype(jnp.bfloat16)
+    Q_bias = Q_bias.astype(jnp.bfloat16)
+    K_bias = K_bias.astype(jnp.bfloat16)
     ADT = _pad_seq(ADT, ax=2)
     DT = _pad_seq(DT, ax=2)
     Trap = _pad_seq(Trap, ax=2)
