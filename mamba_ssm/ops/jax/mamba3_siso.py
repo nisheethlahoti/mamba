@@ -7,7 +7,7 @@ Backward pass is handled automatically by jax.grad through jax.lax.scan.
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -33,18 +33,15 @@ def _angle_dt_scan_body(state, chunk):
 def angle_dt_cumsum(
     angles: jnp.ndarray,
     dt: jnp.ndarray,
-    init_state: Optional[jnp.ndarray] = None,
     chunk_size: int = 64,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> jnp.ndarray:
     """Compute cumsum(tanh(angles) * pi * dt) mod 2pi, chunked.
 
     Args:
         angles:     (batch, seqlen, nheads, dim)
         dt:         (batch, nheads, seqlen)
-        init_state: (batch, nheads, dim) or None
     Returns:
         out:         (batch, seqlen, nheads, dim)
-        final_state: (batch, nheads, dim)
     """
     batch, seqlen, nheads, dim = angles.shape
     nchunks = seqlen // chunk_size
@@ -62,18 +59,14 @@ def angle_dt_cumsum(
     # scan axis is nchunks, so transpose: (nchunks, BH, chunk_size, dim)
     vals = jnp.transpose(vals, (1, 0, 2, 3))
 
-    if init_state is None:
-        init_state = jnp.zeros((BH, dim), dtype=jnp.float32)
-    else:
-        init_state = init_state.reshape(BH, dim)
+    init_state = jnp.zeros((BH, dim), dtype=jnp.float32)
 
-    final_state, out = lax.scan(_angle_dt_scan_body, init_state, vals)
+    _, out = lax.scan(_angle_dt_scan_body, init_state, vals)
     # out: (nchunks, BH, chunk_size, dim) -> (batch, nheads, nchunks, chunk_size, dim)
     out = jnp.transpose(out, (1, 0, 2, 3)).reshape(batch, nheads, nchunks, chunk_size, dim)
     # -> (batch, seqlen, nheads, dim)
     out = jnp.transpose(out, (0, 2, 3, 1, 4)).reshape(batch, seqlen, nheads, dim)
-    final_state = final_state.reshape(batch, nheads, dim)
-    return out, final_state
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +120,6 @@ def _mamba3_scan(
     Q, K, V, ADT, Q_bias, K_bias,
     angles_cos, angles_sin,
     scale, gamma, D, Z,
-    init_ssm_state,
     chunk_size,
 ):
     """Chunked SSM. All preprocessing done per-chunk inside scan body.
@@ -140,7 +132,6 @@ def _mamba3_scan(
     scale, gamma:   (batch, nheads, seqlen)
     D:              (nheads,)
     Z:              (batch, seqlen, nheads, headdim_v) or None
-    init_ssm_state: (batch, nheads, headdim_v, headdim_qk)
     """
     batch, seqlen, nheads_qk, headdim_qk = Q.shape
     nheads = V.shape[2]
@@ -179,7 +170,7 @@ def _mamba3_scan(
     k_bias_bh = jnp.broadcast_to(K_bias, (batch, nheads, headdim_qk)).reshape(BH, headdim_qk)
     d_bh = jnp.broadcast_to(D, (batch, nheads)).reshape(BH)
 
-    state_init = init_ssm_state.reshape(BH, headdim_v, headdim_qk)
+    state_init = jnp.zeros((BH, headdim_v, headdim_qk), dtype=jnp.float32)
     causal_mask = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=-1)
 
     def _scan_body(ssm_state, inputs):
@@ -235,7 +226,7 @@ def _mamba3_scan(
 
     _scan_body_remat = jax.checkpoint(_scan_body)
 
-    final_state, out_s = lax.scan(
+    _, out_s = lax.scan(
         _scan_body_remat, state_init,
         (q_s, k_s, v_s, adt_s, scale_s, gamma_s, cos_s, sin_s),
     )
@@ -246,8 +237,7 @@ def _mamba3_scan(
     if Z is not None:
         out = out * jax.nn.silu(Z.astype(jnp.float32))
 
-    final_state = final_state.reshape(batch, nheads, headdim_v, headdim_qk)
-    return out, final_state
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -266,13 +256,8 @@ def mamba3_siso_combined(
     Angles: jnp.ndarray,
     D: Optional[jnp.ndarray] = None,
     Z: Optional[jnp.ndarray] = None,
-    init_ssm_state: Optional[jnp.ndarray] = None,
-    init_k_state: Optional[jnp.ndarray] = None,
-    init_v_state: Optional[jnp.ndarray] = None,
-    init_angle_state: Optional[jnp.ndarray] = None,
     chunk_size: int = 64,
-    return_final_states: bool = False,
-) -> Union[jnp.ndarray, Tuple[jnp.ndarray, ...]]:
+) -> jnp.ndarray:
     """Mamba-3 SISO forward pass in pure JAX.
 
     Args:
@@ -287,17 +272,12 @@ def mamba3_siso_combined(
         Angles:    (batch, seqlen, nheads, headdim_angles)
         D:         (nheads,) or None -- skip connection
         Z:         (batch, seqlen, nheads, headdim_v) or None -- gating
-        init_*:    Initial states for recurrent inference, or None
         chunk_size: chunk size (default 64). Must be passed via functools.partial for jit.
-        return_final_states: whether to return final states
 
     Returns:
         out: (batch, seqlen, nheads, headdim_v)
-        If return_final_states, also returns:
-            final_angle_state, final_ssm_state, final_k_state, final_v_state
     """
     batch, seqlen, nheads, headdim_v = V.shape
-    headdim_qk = Q.shape[3]
 
     # Pad seqlen to multiple of chunk_size
     remainder = seqlen % chunk_size
@@ -326,64 +306,27 @@ def mamba3_siso_combined(
         Z = Z.astype(jnp.bfloat16)
 
     # 1. Angle-DT cumsum
-    angles_cumsum, final_angle_state = angle_dt_cumsum(
-        Angles, DT, init_state=init_angle_state, chunk_size=chunk_size,
-    )
+    angles_cumsum = angle_dt_cumsum(Angles, DT, chunk_size=chunk_size)
 
-    # 2. Precompute cos/sin of angles (small, avoids trig in scan body)
+    # 2. Precompute cos/sin of angles (avoids trig in scan body)
     angles_cos = jnp.cos(angles_cumsum.astype(jnp.float32))
     angles_sin = jnp.sin(angles_cumsum.astype(jnp.float32))
 
     # 3. Scale/gamma
     scale, gamma = _compute_scale_gamma(DT, Trap)
 
-    # 4. Initial state
-    if init_ssm_state is not None and init_k_state is not None and init_v_state is not None:
-        dt0 = DT[:, :, 0:1]
-        trap0 = jax.nn.sigmoid(Trap[:, :, 0:1].astype(jnp.float32))
-        ssm_state_init = init_ssm_state + (
-            init_v_state[..., None] * init_k_state[..., None, :]
-            * (dt0[..., None] * (1 - trap0[..., None]))
-        )
-    else:
-        ssm_state_init = jnp.zeros(
-            (batch, nheads, headdim_v, headdim_qk), dtype=jnp.float32
-        )
-
     d_val = D if D is not None else jnp.zeros(nheads, dtype=jnp.float32)
 
-    # 5. Core scan
-    out, final_ssm_state = _mamba3_scan(
+    # 4. Core scan
+    out = _mamba3_scan(
         Q, K, V, ADT, Q_bias, K_bias,
         angles_cos, angles_sin,
         scale, gamma, d_val, Z,
-        ssm_state_init, chunk_size,
+        chunk_size,
     )
 
     # Trim padding
     if remainder != 0:
         out = out[:, :seqlen]
 
-    if not return_final_states:
-        return out
-
-    final_v_state = V[:, seqlen - 1]
-
-    # Final K state: rotated+biased K at last position
-    nheads_qk = Q.shape[2]
-    gqa_ratio = nheads // nheads_qk
-    k_last = K[:, seqlen - 1]  # (batch, nheads_qk, headdim_qk)
-    if gqa_ratio > 1:
-        k_last = jnp.repeat(k_last, gqa_ratio, axis=1)
-    k_last = k_last + K_bias
-    cos_last = angles_cos[:, seqlen - 1]  # (batch, nheads, headdim_angles)
-    sin_last = angles_sin[:, seqlen - 1]
-    # _apply_rotary_batched expects (BH, L, dim) — add L=1 dim, then squeeze
-    BH = batch * nheads
-    final_k_state = _apply_rotary_batched(
-        k_last.reshape(BH, 1, headdim_qk),
-        cos_last.reshape(BH, 1, -1),
-        sin_last.reshape(BH, 1, -1),
-    ).reshape(batch, nheads, headdim_qk)
-
-    return out, final_angle_state, final_ssm_state, final_k_state, final_v_state
+    return out
