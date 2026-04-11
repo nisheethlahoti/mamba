@@ -3,7 +3,17 @@
 import jax
 import jax.numpy as jnp
 from einops import rearrange, repeat
-from jax import Array, lax
+from jax import Array
+from jax._src.lax.control_flow.loops import _interleave
+
+
+def trace(x: Array, coeff: Array) -> Array:
+    if not x.shape[0]:
+        return jnp.zeros((1,) + x.shape[1:], x.dtype)
+    x0, x1 = x[::2], x[1::2]
+    c0, c1 = coeff[::2], coeff[1::2]
+    arr = trace(x0[: x1.shape[0]] * c1 + x1, c0[: c1.shape[0]] * c1)
+    return _interleave(arr, arr[: x0.shape[0]] * c0 + x0, axis=0)
 
 
 def angle_dt_cumsum(angles: Array, dt: Array) -> Array:
@@ -43,112 +53,83 @@ def _apply_rotary_batched(x, cos, sin):
 
 def _compute_scale_gamma(DT, Trap):
     """DT, Trap: (batch, nheads, seqlen). Returns scale, gamma same shape."""
-    dt_f32 = DT.astype(jnp.float32)
-    trap_sig = jax.nn.sigmoid(Trap.astype(jnp.float32))
-    # Shifted versions: value at t+1, zero-padded at the end
-    dt_shifted = jnp.pad(dt_f32[:, :, 1:], [(0, 0), (0, 0), (0, 1)])
-    trap_sig_shifted = jnp.pad(trap_sig[:, :, 1:], [(0, 0), (0, 0), (0, 1)])
-    gamma = dt_f32 * trap_sig
-    scale = dt_shifted * (1 - trap_sig_shifted) + gamma
+    trap_sig = jax.nn.sigmoid(Trap)
+    dt_shifted = jnp.pad(DT[:, :, 1:], [(0, 0), (0, 0), (0, 1)])
+    gamma = DT * trap_sig
+    scale = dt_shifted - jnp.diff(gamma, append=0)
     return scale, gamma
 
 
 def _mamba3_scan(Q, K, V, ADT, angles, scale, gamma, D, Z, Q_bias, K_bias, chunk_size):
-    """Chunked SSM. All preprocessing done per-chunk inside scan body.
+    """Chunked SSM: parallel intra-chunk precompute + lean sequential scan.
 
-    Q, K:           (batch, seqlen, nheads_qk, headdim_qk)     bf16
-    V:              (batch, seqlen, nheads, headdim_v)         bf16
-    ADT:            (batch, nheads, seqlen)                    f32
-    angles:         (batch, seqlen, nheads, headdim_angles)    bf16
-    scale, gamma:   (batch, nheads, seqlen)                    f32
-    D:              (nheads,)                                  bf16
-    Z:              (batch, seqlen, nheads, headdim_v) or None bf16
-    Q_bias, K_bias: (nheads, headdim_qk)                       bf16
+    Q, K:           (batch, seqlen, nheads_qk, headdim_qk)
+    V:              (batch, seqlen, nheads, headdim_v)
+    ADT:            (batch, nheads, seqlen)  fp32
+    angles:         (batch, seqlen, nheads, headdim_angles)
+    scale, gamma:   (batch, nheads, seqlen)
+    D:              (nheads,)
+    Z:              (batch, seqlen, nheads, headdim_v) or None
+    Q_bias, K_bias: (nheads, headdim_qk)
     """
-    batch, _, nheads_qk, headdim_qk = Q.shape
-    nheads = V.shape[2]
-    headdim_v = V.shape[3]
-    BH = batch * nheads
-    gqa_ratio = nheads // nheads_qk
+    batch = Q.shape[0]
+    gqa_ratio = V.shape[2] // Q.shape[2]
 
-    def _to_chunks(x_blhd):
+    def _to_chunks(x_blhd: Array) -> Array:
         return rearrange(x_blhd, "b (nc cs) h d -> nc (b h) cs d", cs=chunk_size)
 
-    def _to_chunks_bhl(x):
+    def _to_chunks_bhl(x: Array) -> Array:
         return rearrange(x, "b h (nc cs) -> nc (b h) cs", cs=chunk_size)
 
     v_s = _to_chunks(V)
-    adt_s = _to_chunks_bhl(ADT.astype(jnp.float32))
-    scale_s = _to_chunks_bhl(scale.astype(jnp.bfloat16))
-    gamma_s = _to_chunks_bhl(gamma.astype(jnp.bfloat16))
-    cos_s = _to_chunks(jnp.cos(angles))
-    sin_s = _to_chunks(jnp.sin(angles))
+    da_cumsum = _to_chunks_bhl(ADT).cumsum(axis=-1)
+    scale_s = _to_chunks_bhl(scale)
+    gamma_s = _to_chunks_bhl(gamma)
+    angles = _to_chunks(angles)
     q_s = _to_chunks(Q)
     k_s = _to_chunks(K)
 
+    q_bias_bh = repeat(Q_bias, "h d -> (b h) 1 d", b=batch)
+    k_bias_bh = repeat(K_bias, "h d -> (b h) 1 d", b=batch)
     d_bh = repeat(D, "h -> (b h)", b=batch)
-    state_init = jnp.zeros((BH, headdim_v, headdim_qk), dtype=jnp.float32)
-    causal_mask = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=-1)
 
-    def _scan_body(ssm_state, inputs):
-        """One chunk, all batch*heads in parallel via batched matmul.
+    def _gqa_expand(vec: Array, bias: Array) -> Array:
+        # vec: (bhq cs d), bias: (bh d)
+        return repeat(vec, "bhq cs d -> (bhq r) cs d", r=gqa_ratio) + bias
 
-        ssm_state: (BH, headdim_v, headdim_qk)
-        """
-        q, k, v, adt, sc, gm, cos_a, sin_a = inputs
-        # q, k: (BHq, chunk_size, hqk)
-        # v:    (BH, chunk_size, hv)
-        # adt, sc, gm: (BH, chunk_size)
-        # cos_a, sin_a: (BH, chunk_size, ha)
+    def _intra_chunk_pre(k, v, da_cs, sc, ang):
+        k = _gqa_expand(k, k_bias_bh)
+        k = _apply_rotary_batched(k, jnp.cos(ang), jnp.sin(ang))
+        # State update: V_scaled^T @ K → (BH, hv, hqk), precomputed
+        weight = sc * jnp.exp(da_cs[:, -1:] - da_cs).astype(jnp.bfloat16)
+        return v.mT * weight[:, None, :] @ k  # (BH, hv, hqk)
 
-        # GQA expand Q, K per-chunk
-        if gqa_ratio > 1:
-            q = repeat(q, "bhq cs d -> (bhq r) cs d", r=gqa_ratio)
-            k = repeat(k, "bhq cs d -> (bhq r) cs d", r=gqa_ratio)
-
-        # Apply bias (after GQA expansion)
-        q = q + repeat(Q_bias, "h d -> (b h) 1 d", b=batch)
-        k = k + repeat(K_bias, "h d -> (b h) 1 d", b=batch)
-
-        # QK dot (before rotary)
-        qk_dot = (q * k).sum(axis=-1) * gm  # (BH, chunk_size)
-
-        # Rotary (precomputed cos/sin)
+    def _intra_chunk_post(q, k, v, sc, gm, da_cs, prev_state, ang):
+        q = _gqa_expand(q, q_bias_bh)
+        k = _gqa_expand(k, k_bias_bh)
+        # Rotary
+        cos_a = jnp.cos(ang)
+        sin_a = jnp.sin(ang)
         q = _apply_rotary_batched(q, cos_a, sin_a)
         k = _apply_rotary_batched(k, cos_a, sin_a)
+        # Intra-chunk causal attention (clipping is done to prevent inf grads)
+        mask = jnp.exp((da_cs[..., None] - da_cs[:, None]).clip(max=0)).astype(sc.dtype)
+        mask = jnp.tril(mask, k=-1) * sc[:, None, :] + jax.vmap(jnp.diag)(gm)
+        s = q @ k.mT * mask
+        # Local output = intra + D-skip + QK diagonal
+        local_out = s @ v + d_bh[:, None, None] * v
+        exp_cs = jnp.exp(da_cs).astype(jnp.bfloat16)[..., None]
+        return local_out + q @ prev_state.mT * exp_cs
 
-        # Scale K
-        k = k * sc[:, :, None]
-
-        # --- SSM ---
-        da_cs = adt.cumsum(axis=-1)
-        da_cs_last = da_cs[:, -1]
-
-        # Inter-chunk: (BH, L, hqk) @ (BH, hqk, hv) -> (BH, L, hv)
-        acc_o = q @ ssm_state.astype(jnp.bfloat16).transpose(0, 2, 1)
-        acc_o = acc_o * jnp.exp(da_cs)[:, :, None]
-
-        # Intra-chunk: (BH, L, hqk) @ (BH, hqk, L) -> (BH, L, L)
-        s = q @ k.transpose(0, 2, 1)  # bf16
-        s *= jnp.exp(jnp.minimum(da_cs[:, :, None] - da_cs[:, None, :], 0.0)).astype(jnp.bfloat16)
-        s = jnp.where(causal_mask[None, :, :], s, 0.0)
-        acc_o = acc_o + s @ v
-
-        # D-skip + QK diagonal
-        acc_o = acc_o + (d_bh[:, None] + qk_dot)[:, :, None] * v
-
-        # State update
-        da_cs_rev = da_cs_last[:, None] - da_cs
-        v_scaled = v * jnp.exp(da_cs_rev)[:, :, None]
-        new_state = ssm_state * jnp.exp(da_cs_last)[:, None, None]
-        # (BH, hv, L) @ (BH, L, hqk) -> (BH, hv, hqk)
-        new_state += v_scaled.transpose(0, 2, 1) @ k
-
-        return new_state, acc_o.astype(jnp.bfloat16)
-
-    arrs = q_s, k_s, v_s, adt_s, scale_s, gamma_s, cos_s, sin_s
-    _, out_s = lax.scan(jax.checkpoint(_scan_body), state_init, arrs)
-    out = rearrange(out_s, "nc (b h) cs d -> b (nc cs) h d", b=batch, h=nheads)
+    state_update = jax.vmap(jax.checkpoint(_intra_chunk_pre))(
+        k_s, v_s, da_cumsum, scale_s, angles
+    )
+    exp_cs = jnp.exp(da_cumsum[..., -1]).astype(jnp.bfloat16)
+    states = trace(state_update[:-1], exp_cs[:-1, :, None, None])  # Inter-chunk
+    out = jax.vmap(jax.checkpoint(_intra_chunk_post))(
+        q_s, k_s, v_s, scale_s, gamma_s, da_cumsum, states, angles
+    )
+    out = rearrange(out, "nc (b h) cs d -> b (nc cs) h d", b=batch)
 
     if Z is not None:
         out = out * jax.nn.silu(Z.astype(jnp.float32))
@@ -204,9 +185,9 @@ def mamba3_siso_combined(
     Angles = _pad_seq(Angles).astype(jnp.bfloat16)
     Q_bias = Q_bias.astype(jnp.bfloat16)
     K_bias = K_bias.astype(jnp.bfloat16)
-    ADT = _pad_seq(ADT, ax=2)
-    DT = _pad_seq(DT, ax=2)
-    Trap = _pad_seq(Trap, ax=2)
+    ADT = _pad_seq(ADT, ax=2).astype(jnp.float32)
+    DT = _pad_seq(DT, ax=2).astype(jnp.bfloat16)
+    Trap = _pad_seq(Trap, ax=2).astype(jnp.bfloat16)
     if Z is not None:
         Z = _pad_seq(Z).astype(jnp.bfloat16)
 
