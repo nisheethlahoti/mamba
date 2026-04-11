@@ -6,15 +6,8 @@ from einops import rearrange, repeat
 from jax import Array, lax
 
 
-def _angle_dt_scan_body(state, chunk):
-    """angle_dt_cumsum. state: (BH, dim), chunk: (BH, chunk_size, dim)"""
-    out = (chunk.cumsum(axis=1) + state[:, None, :]) % (2 * jnp.pi)
-    new_state = (state + chunk.sum(axis=1)) % (2 * jnp.pi)
-    return new_state, out
-
-
-def angle_dt_cumsum(angles: Array, dt: Array, chunk_size: int = 64) -> Array:
-    """Compute cumsum(tanh(angles) * pi * dt) mod 2pi, chunked.
+def angle_dt_cumsum(angles: Array, dt: Array) -> Array:
+    """Compute cumsum(tanh(angles) * pi * dt) mod 2pi.
 
     Args:
         angles:     (batch, seqlen, nheads, dim)
@@ -22,15 +15,9 @@ def angle_dt_cumsum(angles: Array, dt: Array, chunk_size: int = 64) -> Array:
     Returns:
         out:         (batch, seqlen, nheads, dim)
     """
-    batch, _, nheads, dim = angles.shape
-
     vals = jnp.tanh(angles.astype(jnp.float32)) * jnp.pi
-    vals = rearrange(vals, "b (nc cs) h d -> b h nc cs d", cs=chunk_size)
-    dt_r = rearrange(dt, "b h (nc cs) -> b h nc cs 1", cs=chunk_size)
-    vals = rearrange(vals * dt_r, "b h nc cs d -> nc (b h) cs d")
-
-    _, out = lax.scan(_angle_dt_scan_body, jnp.zeros((batch * nheads, dim)), vals)
-    out = rearrange(out, "nc (b h) cs d -> b (nc cs) h d", b=batch, h=nheads)
+    vals *= rearrange(dt, "b h s -> b s h 1")
+    out = vals.cumsum(axis=1) % (2 * jnp.pi)
     return out.astype(angles.dtype)
 
 
@@ -42,14 +29,16 @@ def _apply_rotary_batched(x, cos, sin):
     sin: (BH, chunk_size, n_rot)
     """
     n_rot = cos.shape[-1]
-    x0, x1 = rearrange(x, "bh l (p two) -> two bh l p", two=2)
+    x = rearrange(x, "bh l (p two) -> bh l p two", two=2)
+    x0, x1 = jnp.unstack(x, axis=-1)
 
     ro0 = x0[..., :n_rot] * cos - x1[..., :n_rot] * sin
     ro1 = x0[..., :n_rot] * sin + x1[..., :n_rot] * cos
 
     out0 = jnp.concatenate([ro0, x0[..., n_rot:]], axis=-1)
     out1 = jnp.concatenate([ro1, x1[..., n_rot:]], axis=-1)
-    return rearrange([out0, out1], "two bh l p -> bh l (p two)")
+    out = jnp.stack([out0, out1], axis=-1)
+    return rearrange(out, "bh l p two -> bh l (p two)")
 
 
 def _compute_scale_gamma(DT, Trap):
@@ -97,8 +86,7 @@ def _mamba3_scan(Q, K, V, ADT, angles, scale, gamma, D, Z, Q_bias, K_bias, chunk
     q_s = _to_chunks(Q)
     k_s = _to_chunks(K)
 
-    d_bh = repeat(D.astype(jnp.float32), "h -> (b h)", b=batch)
-
+    d_bh = repeat(D, "h -> (b h)", b=batch)
     state_init = jnp.zeros((BH, headdim_v, headdim_qk), dtype=jnp.float32)
     causal_mask = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=-1)
 
@@ -130,7 +118,7 @@ def _mamba3_scan(Q, K, V, ADT, angles, scale, gamma, D, Z, Q_bias, K_bias, chunk
         k = _apply_rotary_batched(k, cos_a, sin_a)
 
         # Scale K
-        k = k * sc.astype(jnp.bfloat16)[:, :, None]
+        k = k * sc[:, :, None]
 
         # --- SSM ---
         da_cs = adt.cumsum(axis=-1)
@@ -141,10 +129,10 @@ def _mamba3_scan(Q, K, V, ADT, angles, scale, gamma, D, Z, Q_bias, K_bias, chunk
         acc_o = acc_o * jnp.exp(da_cs)[:, :, None]
 
         # Intra-chunk: (BH, L, hqk) @ (BH, hqk, L) -> (BH, L, L)
-        s: Array = q @ k.transpose(0, 2, 1)
-        s = s * jnp.exp(jnp.minimum(da_cs[:, :, None] - da_cs[:, None, :], 0.0))
+        s = q @ k.transpose(0, 2, 1)  # bf16
+        s *= jnp.exp(jnp.minimum(da_cs[:, :, None] - da_cs[:, None, :], 0.0)).astype(jnp.bfloat16)
         s = jnp.where(causal_mask[None, :, :], s, 0.0)
-        acc_o = acc_o + s.astype(jnp.bfloat16) @ v
+        acc_o = acc_o + s @ v
 
         # D-skip + QK diagonal
         acc_o = acc_o + (d_bh[:, None] + qk_dot)[:, :, None] * v
@@ -208,7 +196,7 @@ def mamba3_siso_combined(
     def _pad_seq(x, ax=1):
         pad_widths = [(0, 0)] * x.ndim
         pad_widths[ax] = (0, pad_len)
-        return jnp.pad(x, pad_widths)
+        return jnp.pad(x, pad_widths) if pad_len else x
 
     Q = _pad_seq(Q).astype(jnp.bfloat16)
     K = _pad_seq(K).astype(jnp.bfloat16)
@@ -223,8 +211,8 @@ def mamba3_siso_combined(
         Z = _pad_seq(Z).astype(jnp.bfloat16)
 
     scale, gamma = _compute_scale_gamma(DT, Trap)
-    angle_cumsum = angle_dt_cumsum(Angles, DT, chunk_size=chunk_size)
-    D = jnp.zeros(nheads, dtype=jnp.float32) if D is None else D
+    angle_cumsum = angle_dt_cumsum(Angles, DT)
+    D = jnp.zeros(nheads, dtype=jnp.bfloat16) if D is None else D.astype(jnp.bfloat16)
 
     out = _mamba3_scan(
         Q, K, V, ADT, angle_cumsum, scale, gamma, D, Z, Q_bias, K_bias, chunk_size
