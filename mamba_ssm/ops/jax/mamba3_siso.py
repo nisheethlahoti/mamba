@@ -1,43 +1,42 @@
 """Mamba-3 SISO in pure JAX"""
 
+# ruff: noqa: F722
 import jax
 import jax.numpy as jnp
-from einops import rearrange, repeat
+from einops import rearrange
 from jax import Array
 from jax._src.lax.control_flow.loops import _interleave
+from jaxtyping import Float
 
 
-def trace(x: Array, coeff: Array) -> Array:
+def parallel_scan(x: Array, coeff: Array) -> Array:
+    """Parallel prefix scan for the linear recurrence s[i+1] = coeff[i] * s[i] + x[i].
+
+    Returns all n+1 states s[0..n] (with s[0] = 0) using a Blelloch-style
+    divide-and-conquer over axis 0, giving O(n) work in O(log n) depth.
+    """
     if not x.shape[0]:
         return jnp.zeros((1,) + x.shape[1:], x.dtype)
     x0, x1 = x[::2], x[1::2]
     c0, c1 = coeff[::2], coeff[1::2]
-    arr = trace(x0[: x1.shape[0]] * c1 + x1, c0[: c1.shape[0]] * c1)
+    arr = parallel_scan(x0[: x1.shape[0]] * c1 + x1, c0[: c1.shape[0]] * c1)
     return _interleave(arr, arr[: x0.shape[0]] * c0 + x0, axis=0)
 
 
-def angle_dt_cumsum(angles: Array, dt: Array) -> Array:
-    """Compute cumsum(tanh(angles) * pi * dt) mod 2pi.
-
-    Args:
-        angles:     (batch, seqlen, nheads, dim)
-        dt:         (batch, nheads, seqlen)
-    Returns:
-        out:         (batch, seqlen, nheads, dim)
-    """
+def angle_dt_cumsum(
+    angles: Float[Array, "b s nh d"], dt: Float[Array, "b nh s"]
+) -> Float[Array, "b s nh d"]:
+    """Compute cumsum(tanh(angles) * pi * dt) mod 2pi."""
     vals = jnp.tanh(angles.astype(jnp.float32)) * jnp.pi
     vals *= rearrange(dt, "b h s -> b s h 1")
     out = vals.cumsum(axis=1) % (2 * jnp.pi)
     return out.astype(angles.dtype)
 
 
-def _apply_rotary_batched(x, cos, sin):
-    """Apply rotary embedding, batched.
-
-    x:   (BH, chunk_size, headdim_qk)
-    cos: (BH, chunk_size, n_rot)
-    sin: (BH, chunk_size, n_rot)
-    """
+def _apply_rotary_batched(
+    x: Float[Array, "b s d"], cos: Float[Array, "b s rot"], sin: Float[Array, "b s rot"]
+) -> Float[Array, "b s d"]:
+    """Apply rotary embedding, batched."""
     n_rot = cos.shape[-1]
     x = rearrange(x, "bh l (p two) -> bh l p two", two=2)
     x0, x1 = jnp.unstack(x, axis=-1)
@@ -51,8 +50,10 @@ def _apply_rotary_batched(x, cos, sin):
     return rearrange(out, "bh l p two -> bh l (p two)")
 
 
-def _compute_scale_gamma(DT, Trap):
-    """DT, Trap: (batch, nheads, seqlen). Returns scale, gamma same shape."""
+def _compute_scale_gamma(
+    DT: Float[Array, "b nh s"], Trap: Float[Array, "b nh s"]
+) -> tuple[Float[Array, "b nh s"], Float[Array, "b nh s"]]:
+    """Compute trapezoidal scale and gamma from DT and Trap."""
     trap_sig = jax.nn.sigmoid(Trap)
     dt_shifted = jnp.pad(DT[:, :, 1:], [(0, 0), (0, 0), (0, 1)])
     gamma = DT * trap_sig
@@ -60,145 +61,128 @@ def _compute_scale_gamma(DT, Trap):
     return scale, gamma
 
 
-def _qk_dot(q: Array, k: Array, q0: Array, k0: Array) -> Array:
-    """
-    q, k:           (batch, seqlen, nheads_qk, headdim_qk)
-    q_bias, k_bias: (nheads, headdim_qk)
-    return:         (batch, seqlen, nheads)
-    """
-    q0 = rearrange(q0, "(h r) d -> h r d", h=q.shape[2])
-    k0 = rearrange(k0, "(h r) d -> h r d", h=k.shape[2])
-    out = jnp.einsum("bshd,hrd->bshr", q, k0) + jnp.einsum("bshd,hrd->bshr", k, q0)
-    out += jnp.einsum("bshd,bshd->bsh", q, k)[..., None]
-    out += (q0 * k0).sum(-1)
-    return rearrange(out, "b s h r -> b s (h r)")
+def _mamba3_fn(
+    Q: Float[Array, "seqlen dqk"],
+    K: Float[Array, "seqlen dqk"],
+    V: Float[Array, "seqlen gqa dv"],
+    ADT: Float[Array, "gqa seqlen"],
+    angle: Float[Array, "seqlen gqa hdangles"],
+    scale: Float[Array, "gqa seqlen"],
+    gamma: Float[Array, "gqa seqlen"],
+    D: Float[Array, "gqa"],  # noqa: F821
+    Q_bias: Float[Array, "gqa dqk"],
+    K_bias: Float[Array, "gqa dqk"],
+    chunk_size: int,
+) -> Float[Array, "seqlen gqa dv"]:
+    """Chunked SSM for a single QK-head."""
 
+    def _to_chunks(x: Array, axis: int) -> tuple[int, Array]:
+        """Split `axis` into two axes, the second with size `chunk_size`. Return
+        tuple of (axis, chunked_array)"""
+        y = x.reshape(*x.shape[:axis], -1, chunk_size, *x.shape[axis + 1 :])
+        return axis, y
 
-def _mamba3_scan(Q, K, V, ADT, angles, scale, gamma, D, Z, Q_bias, K_bias, chunk_size):
-    """Chunked SSM: parallel intra-chunk precompute + lean sequential scan.
+    v_s = _to_chunks(V * scale.T[..., None], 0)
+    adt_ax, adt_arr = _to_chunks(ADT, 1)
+    adt_cumsum = adt_ax, adt_arr.cumsum(axis=-1)
+    angle_s = _to_chunks(angle, 0)
+    q_s = _to_chunks(Q, 0)
+    k_s = _to_chunks(K, 0)
 
-    Q, K:           (batch, seqlen, nheads_qk, headdim_qk)
-    V:              (batch, seqlen, nheads, headdim_v)
-    ADT:            (batch, nheads, seqlen)  fp32
-    angles:         (batch, seqlen, nheads, headdim_angles)
-    scale, gamma:   (batch, nheads, seqlen)
-    D:              (nheads,)
-    Z:              (batch, seqlen, nheads, headdim_v) or None
-    Q_bias, K_bias: (nheads, headdim_qk)
-    """
-    batch = Q.shape[0]
-    gqa_ratio = V.shape[2] // Q.shape[2]
+    def intra_chunk_pre(
+        k: Float[Array, "cs dqk"],
+        v: Float[Array, "cs gqa dv"],
+        adt_cs: Float[Array, "gqa cs"],
+        ang: Float[Array, "cs gqa rot"],
+    ) -> Float[Array, "gqa dv dqk"]:
+        ang = ang.transpose(1, 0, 2)
+        k = _apply_rotary_batched(k + K_bias[:, None], jnp.cos(ang), jnp.sin(ang))
+        weight = jnp.exp(adt_cs[:, -1:] - adt_cs).astype(v.dtype)
+        return v.transpose(1, 2, 0) * weight[:, None, :] @ k
 
-    def _to_chunks(x_blhd: Array) -> Array:
-        return rearrange(x_blhd, "b (nc cs) h d -> nc (b h) cs d", cs=chunk_size)
-
-    def _to_chunks_bhl(x: Array) -> Array:
-        return rearrange(x, "b h (nc cs) -> nc (b h) cs", cs=chunk_size)
-
-    v_s = _to_chunks(V * scale.mT[..., None])
-    da_cumsum = _to_chunks_bhl(ADT).cumsum(axis=-1)
-    angles = _to_chunks(angles)
-    q_s = _to_chunks(Q)
-    k_s = _to_chunks(K)
-
-    q_bias_bh = repeat(Q_bias, "h d -> (b h) 1 d", b=batch)
-    k_bias_bh = repeat(K_bias, "h d -> (b h) 1 d", b=batch)
-
-    def _gqa_with_rotary(vec: Array, bias: Array, cos: Array, sin: Array) -> Array:
-        # vec: (bhq cs d), bias: (bh d)
-        vec = repeat(vec, "bhq cs d -> (bhq r) cs d", r=gqa_ratio) + bias
-        return _apply_rotary_batched(vec, cos, sin)
-
-    def _intra_chunk_pre(k, v, da_cs, ang):
-        k = _gqa_with_rotary(k, k_bias_bh, jnp.cos(ang), jnp.sin(ang))
-        # State update: V_scaled^T @ K → (BH, hv, hqk), precomputed
-        weight = jnp.exp(da_cs[:, -1:] - da_cs).astype(jnp.bfloat16)
-        return v.mT * weight[:, None, :] @ k  # (BH, hv, hqk)
-
-    def _intra_chunk_post(q, k, v, da_cs, prev_state, ang):
+    def intra_chunk_post(
+        q: Float[Array, "cs dqk"],
+        k: Float[Array, "cs dqk"],
+        v: Float[Array, "cs gqa dv"],
+        adt_cs: Float[Array, "gqa cs"],
+        prev_state: Float[Array, "gqa dv dqk"],
+        ang: Float[Array, "cs gqa rot"],
+    ) -> Float[Array, "gqa cs dv"]:
+        ang = ang.transpose(1, 0, 2)
         cos_a = jnp.cos(ang)
         sin_a = jnp.sin(ang)
-        q = _gqa_with_rotary(q, q_bias_bh, cos_a, sin_a)
-        k = _gqa_with_rotary(k, k_bias_bh, cos_a, sin_a)
+        q = _apply_rotary_batched(q + Q_bias[:, None], cos_a, sin_a)
+        k = _apply_rotary_batched(k + K_bias[:, None], cos_a, sin_a)
         # Intra-chunk causal attention (clipping is done to prevent inf grads)
-        mask = jnp.exp((da_cs[..., None] - da_cs[:, None]).clip(max=0))
-        s = q @ k.mT * jnp.tril(mask.astype(jnp.bfloat16), k=-1)
-        exp_cs = jnp.exp(da_cs).astype(jnp.bfloat16)[..., None]
-        return s @ v + q @ prev_state.mT * exp_cs
+        # Mask and s have shape (gqa_ratio, chunk, chunk)
+        mask = jnp.exp((adt_cs[..., None] - adt_cs[:, None]).clip(max=0))
+        s = q @ k.mT * jnp.tril(mask.astype(v.dtype), k=-1)
+        exp_cs = jnp.exp(adt_cs).astype(v.dtype)[..., None]
+        return s @ v.transpose(1, 0, 2) + q @ prev_state.mT * exp_cs
 
-    state_update = jax.vmap(jax.checkpoint(_intra_chunk_pre))(
-        k_s, v_s, da_cumsum, angles
-    )
-    exp_cs = jnp.exp(da_cumsum[..., -1]).astype(jnp.bfloat16)
-    states = trace(state_update[:-1], exp_cs[:-1, :, None, None])  # Inter-chunk
-    out = jax.vmap(jax.checkpoint(_intra_chunk_post))(
-        q_s, k_s, v_s, da_cumsum, states, angles
-    )
-    out = rearrange(out, "nc (b h) cs d -> b (nc cs) h d", b=batch)
-    out += (D + gamma.mT * _qk_dot(Q, K, Q_bias, K_bias))[..., None] * V
-    return out if Z is None else out * jax.nn.silu(Z)
+    def chunked(fn, *args) -> Array:
+        fn = jax.vmap(jax.checkpoint(fn), in_axes=[a[0] for a in args])
+        return fn(*(a[1] for a in args))
+
+    state_update = chunked(intra_chunk_pre, k_s, v_s, adt_cumsum, angle_s)
+    exp_cs = jnp.exp(adt_cumsum[1][..., -1].T).astype(V.dtype)
+    states = parallel_scan(state_update[:-1], exp_cs[:-1, :, None, None])  # Inter-chunk
+    out = chunked(intra_chunk_post, q_s, k_s, v_s, adt_cumsum, (0, states), angle_s)
+    out = rearrange(out, "nc r cs d -> (nc cs) r d")
+    qk_dot = jnp.vecdot(Q, K)[..., None]  # Ultimate shape wanted = (seqlen, gqa_ratio)
+    qk_dot += Q @ K_bias.T + K @ Q_bias.T + jnp.vecdot(Q_bias, K_bias)
+    return out + (D + gamma.T * qk_dot)[..., None] * V
 
 
 def mamba3_siso_combined(
-    Q: Array,
-    K: Array,
-    V: Array,
-    ADT: Array,
-    DT: Array,
-    Trap: Array,
-    Q_bias: Array,
-    K_bias: Array,
-    Angles: Array,
-    D: Array | None = None,
-    Z: Array | None = None,
+    Q: Float[Array, "batch seqlen nheads_qk dqk"],
+    K: Float[Array, "batch seqlen nheads_qk dqk"],
+    V: Float[Array, "batch seqlen nheads dv"],
+    ADT: Float[Array, "batch nheads seqlen"],
+    DT: Float[Array, "batch nheads seqlen"],
+    Trap: Float[Array, "batch nheads seqlen"],
+    Q_bias: Float[Array, "nheads dqk"],
+    K_bias: Float[Array, "nheads dqk"],
+    Angles: Float[Array, "batch seqlen nheads hdangles"],
+    D: Float[Array, "nheads"] | None = None,  # noqa: F821
+    Z: Float[Array, "batch seqlen nheads dv"] | None = None,
     chunk_size: int = 64,
-) -> Array:
+    dtype: jnp.dtype = jnp.bfloat16,
+) -> Float[Array, "batch seqlen nheads dv"]:
     """Mamba-3 SISO forward pass in pure JAX.
-
-    Args:
-        Q:         (batch, seqlen, nheads_qk, headdim_qk)
-        K:         (batch, seqlen, nheads_qk, headdim_qk)
-        V:         (batch, seqlen, nheads, headdim_v)
-        ADT:       (batch, nheads, seqlen) -- A*dt decay factor
-        DT:        (batch, nheads, seqlen) -- time delta (post-softplus)
-        Trap:      (batch, nheads, seqlen) -- trapezoidal factor (raw, pre-sigmoid)
-        Q_bias:    (nheads, headdim_qk)
-        K_bias:    (nheads, headdim_qk)
-        Angles:    (batch, seqlen, nheads, headdim_angles)
-        D:         (nheads,) or None -- skip connection
-        Z:         (batch, seqlen, nheads, headdim_v) or None -- gating
-        chunk_size: chunk size (default 64). Must be passed via functools.partial for jit.
-
-    Returns:
-        out: (batch, seqlen, nheads, headdim_v)
+    chunk_size must be passed via functools.partial for jit.
     """
-    _, seqlen, nheads, _ = V.shape
-
-    # Pad seqlen to multiple of chunk_size
+    seqlen = V.shape[1]
+    nheads_qk = Q.shape[2]
     pad_len = (-seqlen) % chunk_size
 
-    def _pad_seq(x, ax=1):
-        pad_widths = [(0, 0)] * x.ndim
-        pad_widths[ax] = (0, pad_len)
-        return jnp.pad(x, pad_widths) if pad_len else x
+    def pad(x, axis=1, dt=dtype):
+        """Pad sequence axis to a multiple of chunk_size and cast."""
+        pads = [(0, 0)] * x.ndim
+        pads[axis] = (0, pad_len)
+        return jnp.pad(x, pads).astype(dt)
 
-    Q = _pad_seq(Q).astype(jnp.bfloat16)
-    K = _pad_seq(K).astype(jnp.bfloat16)
-    V = _pad_seq(V).astype(jnp.bfloat16)
-    Angles = _pad_seq(Angles).astype(jnp.bfloat16)
-    Q_bias = Q_bias.astype(jnp.bfloat16)
-    K_bias = K_bias.astype(jnp.bfloat16)
-    ADT = _pad_seq(ADT, ax=2).astype(jnp.float32)
-    DT = _pad_seq(DT, ax=2).astype(jnp.bfloat16)
-    Trap = _pad_seq(Trap, ax=2).astype(jnp.bfloat16)
-    if Z is not None:
-        Z = _pad_seq(Z).astype(jnp.bfloat16)
+    def split(x, ax):
+        """Split axis `ax` from nheads into (nheads_qk, gqa_ratio)."""
+        return x.reshape(*x.shape[:ax], nheads_qk, -1, *x.shape[ax + 1 :])
 
-    scale, gamma = _compute_scale_gamma(DT, Trap)
-    angle_cumsum = angle_dt_cumsum(Angles, DT)
-    D = jnp.zeros(nheads, dtype=jnp.bfloat16) if D is None else D.astype(jnp.bfloat16)
+    Q = pad(Q)
+    K = pad(K)
+    V = split(pad(V), 2)
+    Angles = pad(Angles)
+    ADT = split(pad(ADT, 2, jnp.float32), 1)
+    DT = pad(DT, 2)
+    Trap = pad(Trap, 2)
+    Q_bias = split(Q_bias.astype(dtype), 0)
+    K_bias = split(K_bias.astype(dtype), 0)
 
-    out = _mamba3_scan(
-        Q, K, V, ADT, angle_cumsum, scale, gamma, D, Z, Q_bias, K_bias, chunk_size
-    )
-    return out[:, :seqlen]
+    scale, gamma = [split(x, 1) for x in _compute_scale_gamma(DT, Trap)]
+    angle_cumsum = split(angle_dt_cumsum(Angles, DT), 2)
+    D = jnp.zeros_like(Q_bias[..., 0]) if D is None else split(D.astype(dtype), 0)
+
+    # vmap over heads, then batch
+    fn = jax.vmap(_mamba3_fn, in_axes=(1, 1, 1, 0, 1, 0, 0, 0, 0, 0, None), out_axes=1)
+    fn = jax.vmap(fn, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, None, None))
+    out = fn(Q, K, V, ADT, angle_cumsum, scale, gamma, D, Q_bias, K_bias, chunk_size)
+    out = rearrange(out, "b s h r d -> b s (h r) d")[:, :seqlen]
+    return out if Z is None else out * jax.nn.silu(Z.astype(dtype))
